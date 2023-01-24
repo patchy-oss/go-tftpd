@@ -8,32 +8,168 @@ import (
 	"log"
 	"net"
 	"os"
-	"strings"
 )
 
-var (
-	listener    net.PacketConn
-	connections map[string]*client
+const (
+	bodyMaxSize      = 2048
+	defaultBlockSize = 512
+	hdrsize          = 4
 )
 
 func main() {
-	const bodyMaxSize = 2048
-	var err error
-	listener, err = net.ListenPacket("udp", ":8000")
+	server, err := newTFTPServer("8000")
 	check(err)
-	defer listener.Close()
-	connections = make(map[string]*client)
+	defer server.close()
+	server.listenAndServe()
+}
 
-	var req request
-	var addr net.Addr
-	req.body = make([]byte, bodyMaxSize)
+type tftpServer struct {
+	listener    net.PacketConn
+	connections map[string]*client
+}
+
+func newTFTPServer(port string) (*tftpServer, error) {
+	listener, err := net.ListenPacket("udp", fmt.Sprintf(":%v", port))
+	if err != nil {
+		return nil, err
+	}
+
+	return &tftpServer{
+		listener:    listener,
+		connections: make(map[string]*client),
+	}, nil
+}
+
+func (tftp *tftpServer) close() {
+	for _, v := range tftp.connections {
+		v.file.Close()
+	}
+	tftp.listener.Close()
+}
+
+func (tftp *tftpServer) listenAndServe() {
+	body := make([]byte, bodyMaxSize)
 	for {
-		req.numRead, addr, err = listener.ReadFrom(req.body)
+		numRead, addr, err := tftp.listener.ReadFrom(body)
 		if err != nil {
-			log.Printf("main: error while reading packet: '%v'\n", err)
+			log.Printf("error while reading packet: '%v'\n", err)
 			continue
 		}
-		handleRequest(addr, req)
+		err = tftp.handleConnection(addr, numRead, body)
+		if err != nil {
+			log.Printf("got some error: '%v'\n", err)
+		}
+	}
+}
+
+func (tftp *tftpServer) handleConnection(addr net.Addr, numRead int, body []byte) error {
+	cli := newClient(addr)
+	req, err := newRequest(numRead, body)
+	if err != nil {
+		return err
+	}
+
+	err = tftp.handleRequest(cli, req)
+	if err != nil {
+		return err
+	}
+
+	resp := newResponse(cli, req)
+	err = tftp.handleResponse(cli, resp)
+	if err != nil {
+		return err
+	}
+
+	tftp.sendResponse(cli, resp)
+	return nil
+}
+
+func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
+	var err error
+	// check for filename (rrq)
+	// check for disk space
+	// check for file exist (wrq)
+	// access violation ?
+	// no such user ?
+
+	// checking for illegal operations
+	if req.opcode < opRRQ || req.opcode > opERROR {
+		return fmt.Errorf("Illegal operation!\n")
+	}
+
+	// checking for unknown client
+	_, clientExists := tftp.connections[cli.tid.String()]
+	if !clientExists && req.opcode != opRRQ && req.opcode != opWRQ {
+		return fmt.Errorf("Unknown client!\n")
+	}
+
+	if !clientExists {
+		var f *os.File
+
+		if req.opcode == opRRQ {
+			f, err = os.Open(req.filename)
+		} else {
+			f, err = os.Create(req.filename)
+		}
+		if err != nil {
+			return err
+		}
+
+		stat, err := f.Stat()
+		if err != nil {
+			return err
+		}
+
+		cli.file = f
+		cli.bytesLeft = stat.Size()
+		cli.blockSize = defaultBlockSize
+
+		tftp.connections[cli.tid.String()] = cli
+	}
+
+	if req.opcode == opDATA {
+		_, err = io.Copy(cli.file, bytes.NewReader(req.body))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (tftp *tftpServer) handleResponse(cli *client, resp *response) error {
+	if resp.opcode == opDATA {
+		n, err := cli.file.Read(resp.body)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if cli.bytesLeft <= 0 {
+			cli.file.Close()
+			delete(tftp.connections, cli.tid.String())
+		}
+		resp.body = resp.body[:n]
+		cli.bytesLeft -= int64(n)
+	}
+
+	return nil
+}
+
+func (tftp *tftpServer) sendResponse(cli *client, resp *response) (int, error) {
+	header := []byte{0x0, byte(resp.opcode), 0x0, 0x0}
+	binary.BigEndian.PutUint16(header[2:], resp.number)
+	return tftp.listener.WriteTo(append(header, resp.body...), cli.tid)
+}
+
+type client struct {
+	tid       net.Addr
+	file      *os.File
+	blockSize int
+	bytesLeft int64
+}
+
+func newClient(tid net.Addr) *client {
+	return &client{
+		tid: tid,
 	}
 }
 
@@ -49,6 +185,73 @@ type request struct {
 	errorMessage string
 }
 
+func newRequest(numRead int, body []byte) (*request, error) {
+	var err error
+	req := &request{
+		numRead: numRead,
+		body:    body,
+	}
+
+	req.opcode, req.body = operation(req.body[1]), req.body[2:]
+	switch req.opcode {
+	case opRRQ, opWRQ:
+		var n int
+		n, req.filename, err = readCString(req.body)
+		if err != nil {
+			return nil, err
+		}
+		req.body = req.body[n:]
+
+		n, req.mode, err = readCString(req.body)
+		if err != nil {
+			return nil, err
+		}
+		if req.mode != "octet" {
+			return nil, fmt.Errorf("Incorrect mode '%v'. This server only supports 'octet' mode.\n", req.mode)
+		}
+
+		req.body = req.body[n:]
+
+	case opDATA, opACK:
+		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:req.numRead-hdrsize]
+
+	case opERROR:
+		var n int
+		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:]
+		n, req.errorMessage, err = readCString(req.body)
+		if err != nil {
+			return nil, err
+		}
+		req.body = req.body[n:]
+		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
+	}
+
+	return req, nil
+}
+
+type response struct {
+	opcode operation
+	number uint16
+	body   []byte
+}
+
+func newResponse(cli *client, req *request) *response {
+	resp := &response{}
+
+	switch req.opcode {
+	case opRRQ, opACK:
+		resp.body = make([]byte, cli.blockSize)
+		resp.opcode = opDATA
+		resp.number = req.number + 1
+
+	case opWRQ, opDATA:
+		resp.opcode = opACK
+		resp.number = req.number
+	}
+
+	return resp
+}
+
 type operation byte
 
 const (
@@ -59,149 +262,6 @@ const (
 	opACK
 	opERROR
 )
-
-func handleRequest(addr net.Addr, req request) {
-	var err error
-	req.opcode, req.body = operation(req.body[1]), req.body[2:]
-
-	// checking for illegal operations
-	if req.opcode < opRRQ || req.opcode > opERROR {
-		_, err = sendError(addr, ecILL)
-		check(err)
-	}
-
-	// checking for unknown client
-	_, clientExists := connections[addr.String()]
-	if !clientExists && req.opcode != opRRQ && req.opcode != opWRQ {
-		_, err = sendError(addr, ecUTID)
-		check(err)
-	}
-
-	switch req.opcode {
-	case opRRQ, opWRQ:
-		var n int
-		n, req.filename, err = readCString(req.body)
-		check(err)
-		req.body = req.body[n:]
-
-		n, req.mode, err = readCString(req.body)
-		check(err)
-		if req.mode != "octet" {
-			check(fmt.Errorf("Incorrect mode '%v'. This server only supports 'octet' mode.\n", req.mode))
-		}
-
-		req.body = req.body[n:]
-
-	case opDATA, opACK:
-		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:]
-
-	case opERROR:
-		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:]
-		_, req.errorMessage, err = readCString(req.body)
-		check(err)
-		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
-
-		return
-	}
-
-	if !clientExists {
-		addClient(addr, &req)
-		check(err)
-	}
-
-	// check for filename (rrq)
-	// check for disk space
-	// check for file exist (wrq)
-	// access violation ?
-	// no such user ?
-
-	formResponse(addr, &req)
-}
-
-type client struct {
-	file      *os.File
-	blockSize int
-	bytesLeft int64
-}
-
-func addClient(addr net.Addr, req *request) {
-	var err error
-	var f *os.File
-
-	if req.opcode == opRRQ {
-		f, err = os.Open(req.filename)
-	} else {
-		f, err = os.Create(req.filename)
-	}
-	check(err)
-
-	stat, err := f.Stat()
-	check(err)
-
-	connections[addr.String()] = &client{
-		file:      f,
-		blockSize: 512,
-		bytesLeft: stat.Size(),
-	}
-}
-
-type response struct {
-	opcode operation
-	number uint16
-	body   []byte
-}
-
-func formResponse(addr net.Addr, req *request) {
-	const hdrsize = 4
-	var resp response
-	var err error
-
-	c := connections[addr.String()]
-	switch req.opcode {
-	case opRRQ:
-		resp.body = make([]byte, c.blockSize)
-		resp.opcode = opDATA
-		resp.number = 1
-		_, err = c.file.Read(resp.body)
-		check(err)
-
-	case opWRQ:
-		resp.opcode = opACK
-
-	case opDATA:
-		_, err = io.CopyN(c.file, bytes.NewReader(req.body), int64(req.numRead-hdrsize))
-		check(err)
-
-		resp.opcode = opACK
-		resp.number = req.number
-
-		if req.numRead < c.blockSize+hdrsize {
-			c.file.Close()
-			delete(connections, addr.String())
-		}
-
-	case opACK:
-		resp.body = make([]byte, c.blockSize)
-		resp.opcode = opDATA
-		resp.number = req.number + 1
-		n, err := c.file.Read(resp.body)
-		if err != nil && err != io.EOF {
-			check(err)
-		}
-		if c.bytesLeft <= 0 {
-			c.file.Close()
-			delete(connections, addr.String())
-		}
-		resp.body = resp.body[:n]
-		c.bytesLeft -= int64(n)
-
-	case opERROR:
-		return
-	}
-
-	_, err = sendResponse(addr, &resp)
-	check(err)
-}
 
 type errorCode uint16
 
@@ -227,6 +287,7 @@ var errorMessages = map[errorCode]string{
 	ecNOUS: "No such user.",
 }
 
+/*
 func sendError(addr net.Addr, err errorCode, optMessage ...string) (int, error) {
 	message := errorMessages[err]
 	if err == ecNDEF {
@@ -234,12 +295,7 @@ func sendError(addr net.Addr, err errorCode, optMessage ...string) (int, error) 
 	}
 	return sendResponse(addr, &response{opERROR, uint16(err), toCString(message)})
 }
-
-func sendResponse(addr net.Addr, resp *response) (int, error) {
-	header := []byte{0x0, byte(resp.opcode), 0x0, 0x0}
-	binary.BigEndian.PutUint16(header[2:], resp.number)
-	return listener.WriteTo(append(header, resp.body...), addr)
-}
+*/
 
 func toCString(src string) []byte {
 	return append([]byte(src), 0x0)
