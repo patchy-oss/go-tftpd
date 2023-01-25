@@ -18,7 +18,9 @@ const (
 
 func main() {
 	server, err := newTFTPServer("8000")
-	check(err)
+	if err != nil {
+		panic(err)
+	}
 	defer server.close()
 	server.listenAndServe()
 }
@@ -63,7 +65,11 @@ func (tftp *tftpServer) listenAndServe() {
 }
 
 func (tftp *tftpServer) handleConnection(addr net.Addr, numRead int, body []byte) error {
-	cli := newClient(addr)
+	cli, ok := tftp.connections[addr.String()]
+	if !ok {
+		cli = newClient(addr)
+	}
+
 	req, err := newRequest(numRead, body)
 	if err != nil {
 		return err
@@ -80,12 +86,11 @@ func (tftp *tftpServer) handleConnection(addr net.Addr, numRead int, body []byte
 		return err
 	}
 
-	tftp.sendResponse(cli, resp)
-	return nil
+	_, err = tftp.sendResponse(cli, resp)
+	return err
 }
 
 func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
-	var err error
 	// check for filename (rrq)
 	// check for disk space
 	// check for file exist (wrq)
@@ -103,32 +108,21 @@ func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
 		return fmt.Errorf("Unknown client!\n")
 	}
 
+	if req.opcode == opERROR {
+		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
+		return nil
+	}
+
 	if !clientExists {
-		var f *os.File
-
-		if req.opcode == opRRQ {
-			f, err = os.Open(req.filename)
-		} else {
-			f, err = os.Create(req.filename)
-		}
+		err := cli.prepareFromRequest(req)
 		if err != nil {
 			return err
 		}
-
-		stat, err := f.Stat()
-		if err != nil {
-			return err
-		}
-
-		cli.file = f
-		cli.bytesLeft = stat.Size()
-		cli.blockSize = defaultBlockSize
-
 		tftp.connections[cli.tid.String()] = cli
 	}
 
 	if req.opcode == opDATA {
-		_, err = io.Copy(cli.file, bytes.NewReader(req.body))
+		_, err := io.Copy(cli.file, bytes.NewReader(req.body))
 		if err != nil {
 			return err
 		}
@@ -173,6 +167,31 @@ func newClient(tid net.Addr) *client {
 	}
 }
 
+func (cli *client) prepareFromRequest(req *request) error {
+	var err error
+	var f *os.File
+
+	if req.opcode == opRRQ {
+		f, err = os.Open(req.filename)
+	} else {
+		f, err = os.Create(req.filename)
+	}
+	if err != nil {
+		return err
+	}
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	cli.file = f
+	cli.bytesLeft = stat.Size()
+	cli.blockSize = defaultBlockSize
+
+	return nil
+}
+
 type request struct {
 	numRead int
 	body    []byte
@@ -186,6 +205,7 @@ type request struct {
 }
 
 func newRequest(numRead int, body []byte) (*request, error) {
+	var n int
 	var err error
 	req := &request{
 		numRead: numRead,
@@ -195,7 +215,6 @@ func newRequest(numRead int, body []byte) (*request, error) {
 	req.opcode, req.body = operation(req.body[1]), req.body[2:]
 	switch req.opcode {
 	case opRRQ, opWRQ:
-		var n int
 		n, req.filename, err = readCString(req.body)
 		if err != nil {
 			return nil, err
@@ -213,17 +232,16 @@ func newRequest(numRead int, body []byte) (*request, error) {
 		req.body = req.body[n:]
 
 	case opDATA, opACK:
-		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:req.numRead-hdrsize]
+		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:]
+		req.body = req.body[:req.numRead-hdrsize]
 
 	case opERROR:
-		var n int
 		req.number, req.body = binary.BigEndian.Uint16(req.body[:2]), req.body[2:]
 		n, req.errorMessage, err = readCString(req.body)
 		if err != nil {
 			return nil, err
 		}
 		req.body = req.body[n:]
-		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
 	}
 
 	return req, nil
@@ -311,10 +329,4 @@ func readCString(src []byte) (int, string, error) {
 	}
 
 	return end + 1, string(src[:end]), nil
-}
-
-func check(err error) {
-	if err != nil {
-		log.Fatalf("%v: %v\n", os.Args[0], err)
-	}
 }
