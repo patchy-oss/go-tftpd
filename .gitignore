@@ -22,4 +22,4 @@
 go.work
 
 # Binary
-go-tftpd
+cmd/go-tftpd/go-tftpd

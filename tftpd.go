@@ -1,4 +1,4 @@
-package main
+package tftpd
 
 import (
 	"bytes"
@@ -14,46 +14,33 @@ import (
 	"syscall"
 )
 
-const (
-	bodyMaxSize      = 2048
-	defaultBlockSize = 512
-	hdrsize          = 4
-)
-
-func main() {
-	server, err := newTFTPServer("8000")
-	if err != nil {
-		panic(err)
-	}
-	defer server.close()
-	server.listenAndServe()
-}
-
-type tftpServer struct {
+type TFTPServer struct {
 	listener    net.PacketConn
 	connections map[string]*client
 }
 
-func newTFTPServer(port string) (*tftpServer, error) {
+func NewTFTPServer(port string) (*TFTPServer, error) {
 	listener, err := net.ListenPacket("udp", fmt.Sprintf(":%v", port))
 	if err != nil {
 		return nil, err
 	}
 
-	return &tftpServer{
+	return &TFTPServer{
 		listener:    listener,
 		connections: make(map[string]*client),
 	}, nil
 }
 
-func (tftp *tftpServer) close() {
+func (tftp *TFTPServer) Close() {
 	for _, v := range tftp.connections {
 		v.file.Close()
 	}
 	tftp.listener.Close()
 }
 
-func (tftp *tftpServer) listenAndServe() {
+func (tftp *TFTPServer) ListenAndServe() {
+	const bodyMaxSize = 2048
+
 	body := make([]byte, bodyMaxSize)
 	for {
 		numRead, addr, err := tftp.listener.ReadFrom(body)
@@ -66,10 +53,11 @@ func (tftp *tftpServer) listenAndServe() {
 	}
 }
 
-func (tftp *tftpServer) handleConnection(addr net.Addr, numRead int, body []byte) {
+func (tftp *TFTPServer) handleConnection(addr net.Addr, numRead int, body []byte) {
 	cli, ok := tftp.connections[addr.String()]
 	if !ok {
 		cli = newClient(addr)
+		tftp.connections[cli.tid.String()] = cli
 	}
 
 	err := func() error {
@@ -93,20 +81,12 @@ func (tftp *tftpServer) handleConnection(addr net.Addr, numRead int, body []byte
 		return err
 	}()
 
-	if err != nil {
-		tftpErr, ok := err.(*tftpError)
-		if !ok {
-			log.Printf("Got unexpected error: %v\n", err)
-			tftpErr = newTFTPError(ecNDEF, "Unexpected error.")
-		}
-		_, err = tftp.sendError(cli, tftpErr)
-		if err != nil {
-			panic(err)
-		}
+	if err != nil && err != endOfSession {
+		tftp.handleError(cli, err)
 	}
 }
 
-func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
+func (tftp *TFTPServer) handleRequest(cli *client, req *request) error {
 	// check for filename (wrq)
 	// check for disk space
 	// no such user ?
@@ -116,26 +96,30 @@ func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
 		return newTFTPError(ecILL)
 	}
 
+	// checking for the last ack
+	if req.opcode == opACK && cli.inited && cli.lastPkt {
+		delete(tftp.connections, cli.tid.String())
+		return endOfSession
+	}
+
 	// checking for unknown client
-	_, clientExists := tftp.connections[cli.tid.String()]
-	if !clientExists && req.opcode != opRRQ && req.opcode != opWRQ {
+	if !cli.inited && req.opcode != opRRQ && req.opcode != opWRQ {
 		return newTFTPError(ecUTID)
 	}
 
-	// TODO: handle this properly (probably will need to close 'connection')
-	if req.opcode == opERROR {
-		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
-		return nil
-	}
-
-	if !clientExists {
+	if !cli.inited {
 		log.Printf("Got new client: %v\n", cli.tid.String())
 
 		err := cli.prepareFromRequest(req)
 		if err != nil {
 			return err
 		}
-		tftp.connections[cli.tid.String()] = cli
+	}
+
+	// TODO: handle this properly (probably will need to close 'connection')
+	if req.opcode == opERROR {
+		log.Printf("Got error from client: '%s' (%v)\n", req.errorMessage, req.number)
+		return nil
 	}
 
 	// TODO: last data packet, close the client!
@@ -152,7 +136,7 @@ func (tftp *tftpServer) handleRequest(cli *client, req *request) error {
 	return nil
 }
 
-func (tftp *tftpServer) handleResponse(cli *client, resp *response) error {
+func (tftp *TFTPServer) handleResponse(cli *client, resp *response) error {
 	if resp.opcode == opDATA {
 		n, err := cli.file.Read(resp.body)
 		if err != nil && err != io.EOF {
@@ -161,7 +145,7 @@ func (tftp *tftpServer) handleResponse(cli *client, resp *response) error {
 		if cli.bytesLeft <= 0 {
 			log.Printf("Client '%v' has received a file.\n", cli.tid.String())
 			cli.file.Close()
-			delete(tftp.connections, cli.tid.String())
+			cli.lastPkt = true
 		}
 		resp.body = resp.body[:n]
 		cli.bytesLeft -= int64(n)
@@ -170,12 +154,27 @@ func (tftp *tftpServer) handleResponse(cli *client, resp *response) error {
 	return nil
 }
 
-func (tftp *tftpServer) sendError(cli *client, err *tftpError) (int, error) {
+func (tftp *TFTPServer) handleError(cli *client, err error) {
+	tftpErr, ok := err.(*tftpError)
+	if !ok {
+		log.Printf("Got unexpected error: %v\n", err)
+		tftpErr = newTFTPError(ecNDEF, "Unexpected error.")
+	}
+	cli.inited = true
+	cli.lastPkt = true
+	_, err = tftp.sendError(cli, tftpErr)
+	if err != nil {
+		panic(err)
+	}
+
+}
+
+func (tftp *TFTPServer) sendError(cli *client, err *tftpError) (int, error) {
 	log.Println(err)
 	return tftp.sendResponse(cli, &response{opERROR, uint16(err.code), toCString(err.message.Error())})
 }
 
-func (tftp *tftpServer) sendResponse(cli *client, resp *response) (int, error) {
+func (tftp *TFTPServer) sendResponse(cli *client, resp *response) (int, error) {
 	header := []byte{0x0, byte(resp.opcode), 0x0, 0x0}
 	binary.BigEndian.PutUint16(header[2:], resp.number)
 	return tftp.listener.WriteTo(append(header, resp.body...), cli.tid)
@@ -184,6 +183,8 @@ func (tftp *tftpServer) sendResponse(cli *client, resp *response) (int, error) {
 type client struct {
 	tid       net.Addr
 	file      *os.File
+	inited    bool
+	lastPkt   bool
 	blockSize int
 	bytesLeft int64
 }
@@ -195,6 +196,8 @@ func newClient(tid net.Addr) *client {
 }
 
 func (cli *client) prepareFromRequest(req *request) error {
+	const defaultBlockSize = 512
+
 	var err error
 	var f *os.File
 
@@ -227,6 +230,7 @@ func (cli *client) prepareFromRequest(req *request) error {
 	cli.file = f
 	cli.bytesLeft = stat.Size()
 	cli.blockSize = defaultBlockSize
+	cli.inited = true
 
 	return nil
 }
@@ -244,6 +248,8 @@ type request struct {
 }
 
 func newRequest(numRead int, body []byte) (*request, error) {
+	const hdrsize = 4
+
 	var n int
 	var err error
 	req := &request{
@@ -251,6 +257,7 @@ func newRequest(numRead int, body []byte) (*request, error) {
 		body:    body,
 	}
 
+	// TODO: operation BigEndian
 	req.opcode, req.body = operation(req.body[1]), req.body[2:]
 	switch req.opcode {
 	case opRRQ, opWRQ:
@@ -265,7 +272,7 @@ func newRequest(numRead int, body []byte) (*request, error) {
 			return nil, err
 		}
 		if req.mode != "octet" {
-			return nil, newTFTPError(ecNDEF, "Incorrect mode '%v'. This server supports only 'octet' mode.", req.mode)
+			return nil, newTFTPError(ecNDEF, fmt.Sprintf("Incorrect mode '%v'. This server supports only 'octet' mode.", req.mode))
 		}
 
 		req.body = req.body[n:]
@@ -358,6 +365,8 @@ var tftpErrors = [...]error{
 	ecNOUS: errors.New("No such user."),
 }
 
+var endOfSession = errors.New("End of session.")
+
 type operation byte
 
 const (
@@ -368,19 +377,3 @@ const (
 	opACK
 	opERROR
 )
-
-func toCString(src string) []byte {
-	return append([]byte(src), 0x0)
-}
-
-func readCString(src []byte) (int, string, error) {
-	end := 0
-	for ; end < len(src) && src[end] != 0; end++ {
-	}
-
-	if end >= len(src) {
-		return 0, "", fmt.Errorf("Incorrect c string")
-	}
-
-	return end + 1, string(src[:end]), nil
-}
